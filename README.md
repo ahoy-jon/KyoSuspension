@@ -275,6 +275,121 @@ def assume(condition: Boolean): Unit < Hypothesis =
 
 Any computation that can be modeled as "pause here, let someone else decide" can be a suspension.
 
+## Isolate: Managing Effect State Across Boundaries
+
+When forking computations (via fibers, parallel operations, or detached execution), effects require special handling to prevent state leakage and ensure consistency. The **Isolate** abstraction provides mechanisms for managing effect state across these boundaries.
+
+### The Problem
+
+Consider running a computation with `Var[Int]` in parallel:
+
+```scala ignore
+// Without isolation - what happens to Var updates?
+Async.parallel(tasks.map(task => 
+  Var.update[Int](_ + 1) *> task
+))
+```
+
+Should each parallel task see its own state? Should updates be merged? Discarded? The answer depends on your use case.
+
+### The Solution: Isolate[Remove, Keep, Restore]
+
+`Isolate` uses three type parameters to precisely control effect flow:
+
+- **`Remove`**: Effects that will be satisfied (handled) by the isolation
+- **`Keep`**: Effects that remain available during isolated execution  
+- **`Restore`**: Effects that become available after isolation completes
+
+The abstraction follows a three-phase lifecycle:
+
+```scala ignore
+abstract class Isolate[Remove, -Keep, -Restore]:
+  type State
+  type Transform[_]
+  
+  def capture[A, S](f: State => A < S): A < (Remove & Keep & S)
+  def isolate[A, S](state: State, v: A < (S & Remove)): Transform[A] < (Keep & S)
+  def restore[A, S](v: Transform[A] < S): A < (Restore & S)
+```
+
+### Built-in Isolate Strategies
+
+**`Var.isolate.lastUpdate[V]`** - Propagates final state:
+```scala ignore
+val program: Int < Var[Int] =
+  for
+    _ <- Var.set(100)
+    _ <- Var.update[Int](_ * 2)
+    r <- Var.get[Int]
+  yield r
+
+val isolated = Var.isolate.lastUpdate[Int].run(program)
+Var.run(0)(isolated).eval // 200
+```
+
+**`Var.isolate.discard[V]`** - Prevents state leakage:
+```scala ignore
+val program: Int < Var[Int] = Var.set(999) *> Var.get[Int]
+
+val result = Var.run(0) {
+  Var.set(42) *> Var.isolate.discard[Int].run(program) *> Var.get[Int]
+}.eval // 42 (not 999)
+```
+
+**`Var.isolate.conditionalUpdate[E, V]`** - Conditional state based on errors:
+```scala ignore
+enum TransactionError:
+  case InvalidAmount(msg: String)
+  case InsufficientFunds(msg: String)
+
+// Discard Var updates only for InvalidAmount errors
+val isolate = Var.isolate.conditionalUpdate[TransactionError, Int] {
+  case InvalidAmount(_) => true  // discard updates
+  case _                => false // propagate updates
+}
+
+val withdraw: (Int, Int) => Int < (Var[Int] & Abort[TransactionError]) = 
+  (balance, amount) =>
+    for
+      _ <- if amount <= 0 
+           then Abort.fail(InvalidAmount(s"Invalid: $amount")) 
+           else Kyo.unit
+      _ <- if balance < amount 
+           then Abort.fail(InsufficientFunds(s"Need $amount"))
+           else Kyo.unit
+      _ <- Var.set(balance - amount)
+      r <- Var.get[Int]
+    yield r
+
+// Invalid amount: Var NOT updated (discarded)
+Var.run(100)(isolate.run(withdraw(100, -50))).eval
+
+// Insufficient funds: Var IS updated (even on failure)
+Var.run(100)(isolate.run(withdraw(100, 200))).eval
+```
+
+### Composing Isolates
+
+Isolates compose with `andThen`:
+
+```scala ignore
+val composed = Var.isolate.lastUpdate[Int]
+  .andThen(Var.isolate.lastUpdate[String])
+
+// Manages both Var[Int] and Var[String] state
+composed.run(program)
+```
+
+### Why Isolate Matters
+
+While this implementation focuses on sequential execution, `Isolate` becomes critical for:
+
+- **Fiber-based concurrency** - Each fiber needs isolated state
+- **Parallel operations** - Determine how to merge/discard parallel state changes
+- **Backtracking** (Choice effects) - Restore state on alternative branches
+- **Transactional semantics** - Rollback state on failures
+
+The abstraction unifies these use cases under a single, composable API.
 
 ## Built-in Effects
 
@@ -296,6 +411,7 @@ object Sync  // Abort[Nothing] & Defer
 - `03_miniKyo_example.scala` - Basic example
 - `04_miniKyo_multiple_errors_example.scala` - Multiple error channels
 - `05_miniKyo_var.scala` - Stateful computations
+- `06_miniKyo_isolate.scala` - Effect state management across boundaries
 - `99_miniKyo_result.scala` - Result[E, A] type
 - `99_miniKyo_typeMap.scala` - Type-indexed map
 
